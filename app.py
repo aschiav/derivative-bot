@@ -1,4 +1,4 @@
-import os, json, time, random, requests
+import os, json, time, random, requests, base64, io
 from flask import Flask, request, jsonify, session
 
 app = Flask(__name__)
@@ -16,7 +16,7 @@ def add_headers(resp):
 
 # -------- OpenAI Assistants (v2) --------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-ASSISTANT_ID   = os.environ.get("ASSISTANT_ID")  # ← your gpt-4.1 Assistant (asst_...)
+ASSISTANT_ID   = os.environ.get("ASSISTANT_ID")  # your gpt-4.1 Assistant (asst_...)
 if not OPENAI_API_KEY: raise RuntimeError("Missing OPENAI_API_KEY")
 if not ASSISTANT_ID:   raise RuntimeError("Missing ASSISTANT_ID")
 
@@ -29,14 +29,12 @@ OPENAI_ASSIST_HEADERS = {
 def ensure_thread():
     """One thread per student session."""
     if "thread_id" not in session:
-        # make a real API thread so history persists per student
         r = requests.post("https://api.openai.com/v1/threads",
                           headers=OPENAI_ASSIST_HEADERS, timeout=30)
         r.raise_for_status()
         session["thread_id"] = r.json()["id"]
     return session["thread_id"]
 
-# -------- tiny helpers --------
 def _safe_json(req):
     data = req.get_json(silent=True)
     if isinstance(data, dict): return data
@@ -51,6 +49,21 @@ def _safe_json(req):
         except Exception: return {}
     return {}
 
+def _upload_data_url_to_openai(data_url: str, filename: str) -> str:
+    """Upload a data URL to OpenAI Files for Assistants and return file_id."""
+    header, b64 = data_url.split(",", 1)
+    blob = base64.b64decode(b64)
+    files = {"file": (filename, io.BytesIO(blob), "application/octet-stream")}
+    r = requests.post(
+        "https://api.openai.com/v1/files",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        files=files,
+        data={"purpose": "assistants"},
+        timeout=60
+    )
+    r.raise_for_status()
+    return r.json()["id"]
+
 # -------- health --------
 @app.route("/health")
 def health():
@@ -59,7 +72,12 @@ def health():
 # -------- core: send images directly to your Assistant --------
 @app.route("/api/assist", methods=["POST"])
 def assist_api():
-    data = request.get_json(silent=True) or {}
+    """
+    Body:
+      { "f_image": "data:image/...;base64,...", "g_image": "data:image/...;base64,..." }
+    Returns: { "assistant_text": "<model output>" }
+    """
+    data = _safe_json(request)
     f_img = data.get("f_image")
     g_img = data.get("g_image")
     if not f_img or not g_img:
@@ -68,31 +86,54 @@ def assist_api():
     try:
         thread_id = ensure_thread()
 
-        # ✅ Assistants v2 content blocks: "text", "image_url", "image_file"
+        # --- Attempt 1: send as image_url (with {url: ...}) ---
         content = [
             {"type": "text",
-             "text": (
-                 "Please analyze the student's derivative attempt per your tutoring instructions. "
-                 "The first image is the original function f(x). "
-                 "The second image is the student's derivative g(x). "
-                 "Respond LaTeX-first (as text)."
-             )},
-            # ✅ For Assistants, image_url takes an object with {url: ...}
+             "text": ("Please analyze the student's derivative attempt per your tutoring instructions. "
+                      "The first image is the original function f(x). "
+                      "The second image is the student's derivative g(x). "
+                      "Respond LaTeX-first (as text).")},
             {"type": "image_url", "image_url": {"url": f_img}},
             {"type": "image_url", "image_url": {"url": g_img}},
         ]
-
-        # 1) Add message
         r1 = requests.post(
             f"https://api.openai.com/v1/threads/{thread_id}/messages",
             headers=OPENAI_ASSIST_HEADERS,
             json={"role": "user", "content": content},
             timeout=60
         )
+
+        # If org/project disallows data URLs, fall back to uploading
+        if r1.status_code >= 400:
+            body = r1.text.lower()
+            # Try fallback only if the error looks image-url related
+            if "image_url" in body or "url" in body or "invalid" in body:
+                try:
+                    fid_f = _upload_data_url_to_openai(f_img, "f.png")
+                    fid_g = _upload_data_url_to_openai(g_img, "g.png")
+                except Exception as up_e:
+                    return jsonify({"error": "Image upload failed", "details": str(up_e)}), 502
+
+                content = [
+                    {"type": "text",
+                     "text": ("Please analyze the student's derivative attempt per your tutoring instructions. "
+                              "The first image is the original function f(x). "
+                              "The second image is the student's derivative g(x). "
+                              "Respond LaTeX-first (as text).")},
+                    {"type": "image_file", "image_file": {"file_id": fid_f}},
+                    {"type": "image_file", "image_file": {"file_id": fid_g}},
+                ]
+                r1 = requests.post(
+                    f"https://api.openai.com/v1/threads/{thread_id}/messages",
+                    headers=OPENAI_ASSIST_HEADERS,
+                    json={"role": "user", "content": content},
+                    timeout=60
+                )
+
         if r1.status_code >= 400:
             return jsonify({"error":"Assistant add-message error","details":r1.text}), 502
 
-        # 2) Run the Assistant (your assistant is gpt-4.1, response_format=text)
+        # --- Run the Assistant (text output) ---
         r2 = requests.post(
             f"https://api.openai.com/v1/threads/{thread_id}/runs",
             headers=OPENAI_ASSIST_HEADERS,
@@ -103,7 +144,7 @@ def assist_api():
             return jsonify({"error":"Assistant run error","details":r2.text}), 502
         run_id = r2.json()["id"]
 
-        # 3) Poll
+        # Poll
         while True:
             rr = requests.get(
                 f"https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}",
@@ -116,25 +157,32 @@ def assist_api():
         if st != "completed":
             return jsonify({"error": f"run status: {st}", "details": rr.text}), 502
 
-        # 4) Read the latest assistant message
-        msgs = requests.get(
+        # Read latest assistant message
+        rm = requests.get(
             f"https://api.openai.com/v1/threads/{thread_id}/messages?limit=1&order=desc",
             headers=OPENAI_ASSIST_HEADERS, timeout=60
-        ).json()["data"]
+        )
+        if rm.status_code >= 400:
+            return jsonify({"error":"Assistant read-message error","details":rm.text}), 502
 
+        payload = rm.json()
+        data_list = payload.get("data", []) if isinstance(payload, dict) else []
         out_text = ""
-        if msgs and "content" in msgs[0]:
-            for part in msgs[0]["content"]:
-                if part.get("type") == "text":
-                    out_text += part["text"]["value"]
+        if data_list:
+            parts = data_list[0].get("content", [])
+            if isinstance(parts, list):
+                for part in parts:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        txt = part.get("text", {}).get("value", "")
+                        if isinstance(txt, str):
+                            out_text += txt
 
         return jsonify({"assistant_text": out_text or "[no text]"}), 200
 
     except Exception as e:
         return jsonify({"error":"server_exception","details":str(e)}), 500
 
-
-# -------- minimal UI: two image inputs -> Assistant reply --------
+# -------- minimal UI --------
 @app.route("/")
 def ui():
     return """
