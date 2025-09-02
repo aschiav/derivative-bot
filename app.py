@@ -142,7 +142,7 @@ def extract_expr_from_image(data_url, hint_text=""):
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "math_from_image",      # required
+                "name": "math_from_image",
                 "strict": True,
                 "schema": {
                     "type": "object",
@@ -151,7 +151,8 @@ def extract_expr_from_image(data_url, hint_text=""):
                         "expr_latex": {"type": "string", "description": "LaTeX, e.g., \\\\frac{\\\\sin^2 x}{x+1}"},
                         "variable":   {"type": "string", "description": "primary variable, e.g., x"}
                     },
-                    "required": ["expr_sympy"],
+                    # 👇 Make every property required
+                    "required": ["expr_sympy", "expr_latex", "variable"],
                     "additionalProperties": False
                 }
             }
