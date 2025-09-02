@@ -220,7 +220,15 @@ def health():
 
 @app.route("/api/check", methods=["POST"])
 def check_derivative():
-    data = _safe_json_from_request(request)   # ← use hardened parser
+    """
+    JSON body:
+      {
+        "f_image": "data:image/...;base64,...",
+        "g_image": "data:image/...;base64,...",
+        "variable": "x"
+      }
+    """
+    data = _safe_json_from_request(request)   # <- from earlier snippet
     f_img = data.get("f_image")
     g_img = data.get("g_image")
     varname = (data.get("variable") or "x").strip() or "x"
@@ -229,46 +237,31 @@ def check_derivative():
         return jsonify({"error": "Both f_image and g_image are required (data URLs)."}), 400
 
     try:
+        # 1) OCR both images
         raw_f = extract_expr_from_image(f_img, "This is the original function f(x).")
         raw_g = extract_expr_from_image(g_img, "This is the student's claimed derivative g(x).")
 
-        # Make DOUBLE sure these are dicts even if OCR returns odd shapes
-        f_obj = _coerce_ocr(raw_f)
-        g_obj = _coerce_ocr(raw_g)
-    Body: { "f_image": "data:image/...;base64,...",
-            "g_image": "data:image/...;base64,...",
-            "variable": "x" }
-    
-    data = request.get_json(silent=True) or {}
-    f_img = data.get("f_image")
-    g_img = data.get("g_image")
-    varname = (data.get("variable") or "x").strip() or "x"
-
-    if not f_img or not g_img:
-        return jsonify({"error": "Both f_image and g_image are required (data URLs)."}), 400
-
-    try:
-        raw_f = extract_expr_from_image(f_img, "This is the original function f(x).")
-        raw_g = extract_expr_from_image(g_img, "This is the student's claimed derivative g(x).")
-
+        # 2) Coerce to dicts so .get(...) is always safe
         f_obj = _coerce_ocr(raw_f)
         g_obj = _coerce_ocr(raw_g)
 
+        # 3) Pull strings and variable
         f_sym = f_obj.get("expr_sympy", "")
         g_sym = g_obj.get("expr_sympy", "")
-        var = (f_obj.get("variable") or varname).strip() or varname  # prefer f's variable if present
+        var   = (f_obj.get("variable") or varname).strip() or varname
 
-        # Parse & compute
+        # 4) Parse and compute derivative
         f_expr = parse_sympy(f_sym, var)
         g_expr = parse_sympy(g_sym, var)
         x = symbols(var)
         fprime = simplify(diff(f_expr, x))
 
-        # Checks
+        # 5) Checks
         symbolic_ok = simplify(fprime - g_expr) == 0
         numeric_ok, stats = numeric_equiv(fprime, g_expr, var)
         verdict = "correct" if (symbolic_ok or numeric_ok) else "incorrect"
 
+        # 6) Build response
         result = {
             "parsed": {
                 "f_expr_sympy": str(f_expr),
@@ -288,7 +281,7 @@ def check_derivative():
             "verdict": verdict
         }
 
-        # Optional: brief hint if incorrect
+        # Optional: short hint if incorrect
         if verdict == "incorrect":
             hint_prompt = (
                 "Compare the derivative. Given f(x) and a student's g(x), "
