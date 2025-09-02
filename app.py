@@ -10,6 +10,30 @@ from sympy import asin, acos, atan
 from sympy import sinh, cosh, tanh, asinh, acosh, atanh
 from sympy import log, sqrt, Abs, latex
 
+def _safe_json_from_request(req):
+    """
+    Always return a dict from an incoming request body.
+    Handles: proper JSON, double-encoded JSON strings, or non-JSON.
+    """
+    data = req.get_json(silent=True)
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, str):
+        try:
+            j = json.loads(data)
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    if data is None:
+        try:
+            raw = req.get_data(cache=False, as_text=True)
+            j = json.loads(raw)
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 # ── Flask setup ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "change-me")
@@ -136,15 +160,13 @@ def extract_expr_from_image(data_url, hint_text=""):
 
     payload = {
         "model": VISION_MODEL,  # e.g., "gpt-4o-mini" or "gpt-4o"
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": data_url}  # string, not {"url": ...}
-                ]
-            }
-        ],
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": data_url}  # string URL
+            ]
+        }],
         "text": {
             "format": {
                 "type": "json_schema",
@@ -155,23 +177,45 @@ def extract_expr_from_image(data_url, hint_text=""):
         }
     }
 
-    if os.environ.get("DEBUG_SCHEMA") == "1":
-        print("DEBUG text.format.schema =",
-              json.dumps(payload["text"]["format"]["schema"], ensure_ascii=False))
-
     r = requests.post("https://api.openai.com/v1/responses",
                       headers=OPENAI_HEADERS, json=payload, timeout=90)
+
+    # If the API returns non-JSON or an error, raise a clear error
     if r.status_code >= 400:
         raise RuntimeError(f"Vision OCR error {r.status_code}: {r.text}")
 
-    j = r.json()
-    text = j.get("output_text") or \
-           (j.get("output") or [{}])[0].get("content", [{}])[0].get("text", {}).get("value")
-
     try:
-        return json.loads(text) if text else {"expr_sympy": "", "expr_latex": "", "variable": "x"}
+        j = r.json()
     except Exception:
-        return {"expr_sympy": text or "", "expr_latex": text or "", "variable": "x"}
+        # Totally unexpected—treat as empty
+        return {"expr_sympy": "", "expr_latex": "", "variable": "x"}
+
+    # Ensure j is a dict; if it's somehow a string, coerce below
+    text = None
+    if isinstance(j, dict):
+        text = j.get("output_text")
+        if not text:
+            text = (j.get("output") or [{}])[0].get("content", [{}])[0].get("text", {}).get("value")
+
+    if not text and isinstance(j, str):
+        text = j
+
+    # Final coercion to dict
+    if not text:
+        return {"expr_sympy": "", "expr_latex": "", "variable": "x"}
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return {
+                "expr_sympy": obj.get("expr_sympy", ""),
+                "expr_latex": obj.get("expr_latex", obj.get("expr_sympy", "")),
+                "variable":   (obj.get("variable") or "x")
+            }
+        # If JSON was something else (array/string), fall through to wrapper
+    except Exception:
+        pass
+    return {"expr_sympy": text, "expr_latex": text, "variable": "x"}
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/health")
@@ -180,7 +224,21 @@ def health():
 
 @app.route("/api/check", methods=["POST"])
 def check_derivative():
-    """
+    data = _safe_json_from_request(request)   # ← use hardened parser
+    f_img = data.get("f_image")
+    g_img = data.get("g_image")
+    varname = (data.get("variable") or "x").strip() or "x"
+
+    if not f_img or not g_img:
+        return jsonify({"error": "Both f_image and g_image are required (data URLs)."}), 400
+
+    try:
+        raw_f = extract_expr_from_image(f_img, "This is the original function f(x).")
+        raw_g = extract_expr_from_image(g_img, "This is the student's claimed derivative g(x).")
+
+        # Make DOUBLE sure these are dicts even if OCR returns odd shapes
+        f_obj = _coerce_ocr(raw_f)
+        g_obj = _coerce_ocr(raw_g)
     Body: { "f_image": "data:image/...;base64,...",
             "g_image": "data:image/...;base64,...",
             "variable": "x" }
