@@ -206,25 +206,25 @@ def ui():
   .gray { color:#666; }
 </style>
 
-<h2>Assistant Image Test</h2>
-<p class="gray">Uploads go straight to your Assistant; we render its text with MathJax.</p>
+<h2>Derivative Tutor Bot</h2>
+<p class="gray">Here's how it works. Upload an image of the function for which you are trying to find the derivative and an image of the derivative you found. The tutor will tell you if your derivation is correct, and give you assistance if it is not. the .</p>
 
 <div class="card">
   <div class="row">
     <div class="col">
-      <label>Function image (f)</label>
+      <label>Function: (f)</label>
       <input id="fimg" type="file" accept="image/*" capture="environment">
       <div><img id="fprev" class="preview" /></div>
     </div>
     <div class="col">
-      <label>Student derivative image (g)</label>
+      <label>Derivative of function: (f)'</label>
       <input id="gimg" type="file" accept="image/*" capture="environment">
       <div><img id="gprev" class="preview" /></div>
     </div>
   </div>
   <div class="row" style="margin-top:12px">
     <div class="col" style="align-self:end">
-      <button id="go">Ask Assistant</button>
+      <button id="go">Check my work</button>
     </div>
   </div>
 </div>
