@@ -123,21 +123,22 @@ def extract_expr_from_image(data_url, hint_text=""):
         prompt += f" Hint/context: {hint_text}"
 
     payload = {
-        "model": VISION_MODEL,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": {"url": data_url}}
-                ]
-            }
-        ],
-        "response_format": {
+    "model": VISION_MODEL,
+    "input": [{
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": prompt},
+            {"type": "input_image", "image_url": {"url": data_url}}
+        ]
+    }],
+    "text": {                                 # ✅ Responses API uses text.format
+        "format": {
             "type": "json_schema",
             "json_schema": EXTRACT_SCHEMA
         }
     }
+}
+
 
     r = requests.post("https://api.openai.com/v1/responses",
                       headers=OPENAI_HEADERS, json=payload, timeout=90)
