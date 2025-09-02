@@ -251,7 +251,7 @@ fimg.addEventListener('change', async ()=>{ if(fimg.files[0]) fprev.src = await 
 gimg.addEventListener('change', async ()=>{ if(gimg.files[0]) gprev.src = await toDataURL(gimg.files[0]); });
 
 btn.addEventListener('click', async ()=>{
-  out.innerHTML = '<p class="gray">Sending to Assistant…</p>';
+  out.innerHTML = '<p class="gray">Sending to tutor…</p>';
   if(!fimg.files[0] || !gimg.files[0]){ out.innerHTML='<p class="bad">Please upload both images.</p>'; return; }
   const [fdata,gdata] = await Promise.all([toDataURL(fimg.files[0]), toDataURL(gimg.files[0])]);
   try{
