@@ -109,32 +109,51 @@ EXTRACT_SCHEMA = {
 }
 
 def extract_expr_from_image(data_url, hint_text=""):
+    """
+    Ask a vision model to read math from an image and return JSON:
+      { expr_sympy, expr_latex, variable }
+    Expects data_url like: data:image/png;base64,AAAA...
+    """
+    if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
+        raise RuntimeError("Expected a data URL for image (data:image/...;base64,...)")
+
     prompt = (
         "Extract the mathematical expression from this image. "
         "Return JSON with keys: expr_sympy (SymPy syntax; use ** for powers; use log for ln), "
         "expr_latex (best-effort LaTeX), and variable (default 'x'). "
-        "For derivatives in the image, just return the expression shown (do not compute new derivatives). "
+        "If the image already shows a derivative, just transcribe what's shown; do not compute a new derivative."
     )
     if hint_text:
         prompt += f" Hint/context: {hint_text}"
 
     payload = {
-        "model": VISION_MODEL,  # e.g., gpt-4o-mini
+        "model": VISION_MODEL,  # e.g., "gpt-4o-mini" or "gpt-4o"
         "input": [
             {
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt},
-                    # 👇 IMPORTANT: pass the data URL string directly
+                    # IMPORTANT: image_url must be a STRING, not {"url": "..."}
                     {"type": "input_image", "image_url": data_url}
                 ]
             }
         ],
-        # Responses API structured output goes under text.format (not response_format)
+        # Responses API structured outputs now live under text.format
         "text": {
             "format": {
                 "type": "json_schema",
-                "json_schema": EXTRACT_SCHEMA
+                "name": "math_from_image",      # required
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "expr_sympy": {"type": "string", "description": "SymPy syntax, e.g., sin(x)**2/(x+1)"},
+                        "expr_latex": {"type": "string", "description": "LaTeX, e.g., \\\\frac{\\\\sin^2 x}{x+1}"},
+                        "variable":   {"type": "string", "description": "primary variable, e.g., x"}
+                    },
+                    "required": ["expr_sympy"],
+                    "additionalProperties": False
+                }
             }
         }
     }
@@ -145,11 +164,16 @@ def extract_expr_from_image(data_url, hint_text=""):
         raise RuntimeError(f"Vision OCR error {r.status_code}: {r.text}")
 
     j = r.json()
-    text = j.get("output_text") or j.get("output", [{}])[0].get("content", [{}])[0].get("text", {}).get("value")
+    # Prefer output_text; fall back to digging into content if needed
+    text = j.get("output_text") or \
+           (j.get("output") or [{}])[0].get("content", [{}])[0].get("text", {}).get("value")
+
     try:
         return json.loads(text) if text else {"expr_sympy": "", "expr_latex": "", "variable": "x"}
     except Exception:
+        # If the model returned plain text, wrap it
         return {"expr_sympy": text or "", "expr_latex": text or "", "variable": "x"}
+
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
