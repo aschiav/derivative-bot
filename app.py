@@ -10,29 +10,6 @@ from sympy import asin, acos, atan
 from sympy import sinh, cosh, tanh, asinh, acosh, atanh
 from sympy import log, sqrt, Abs, latex
 
-def _safe_json_from_request(req):
-    """
-    Always return a dict from an incoming request body.
-    Handles: proper JSON, double-encoded JSON strings, or non-JSON.
-    """
-    data = req.get_json(silent=True)
-    if isinstance(data, dict):
-        return data
-    if isinstance(data, str):
-        try:
-            j = json.loads(data)
-            return j if isinstance(j, dict) else {}
-        except Exception:
-            return {}
-    if data is None:
-        try:
-            raw = req.get_data(cache=False, as_text=True)
-            j = json.loads(raw)
-            return j if isinstance(j, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
 
 # ── Flask setup ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -83,6 +60,25 @@ def ensure_thread():
     return session["thread_id"]
 
 # ── Math parsing & comparison helpers ─────────────────────────────────────────
+def _safe_json_from_request(req):
+    data = req.get_json(silent=True)
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, str):
+        try:
+            j = json.loads(data)
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    if data is None:
+        try:
+            raw = req.get_data(cache=False, as_text=True)
+            j = json.loads(raw)
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    return {}
+    
 def allowed_locals(varname="x"):
     x = symbols(varname)
     return {
@@ -242,7 +238,7 @@ def check_derivative():
     Body: { "f_image": "data:image/...;base64,...",
             "g_image": "data:image/...;base64,...",
             "variable": "x" }
-    """
+    
     data = request.get_json(silent=True) or {}
     f_img = data.get("f_image")
     g_img = data.get("g_image")
