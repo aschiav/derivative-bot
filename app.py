@@ -1,9 +1,7 @@
-import os, json, base64
-from flask import Flask, request, jsonify
+import os, json, time, random, requests
+from flask import Flask, request, jsonify, session
 
 app = Flask(__name__)
-
-# (Only needed if you later add sessions/cookies inside Canvas)
 app.secret_key = os.environ.get("FLASK_SECRET", "change-me")
 app.config.update(SESSION_COOKIE_SAMESITE="None", SESSION_COOKIE_SECURE=True)
 
@@ -16,107 +14,140 @@ def add_headers(resp):
     resp.headers["X-Frame-Options"] = "ALLOWALL"
     return resp
 
-# ---------- helpers ----------
-def _safe_json_from_request(req):
-    """Always return a dict (handles odd bodies or double-encoded JSON)."""
+# -------- OpenAI Assistants (v2) --------
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ASSISTANT_ID   = os.environ.get("ASSISTANT_ID")  # ← your gpt-4.1 Assistant (asst_...)
+if not OPENAI_API_KEY: raise RuntimeError("Missing OPENAI_API_KEY")
+if not ASSISTANT_ID:   raise RuntimeError("Missing ASSISTANT_ID")
+
+OPENAI_ASSIST_HEADERS = {
+    "Authorization": f"Bearer {OPENAI_API_KEY}",
+    "Content-Type":  "application/json",
+    "OpenAI-Beta":   "assistants=v2",
+}
+
+def ensure_thread():
+    """One thread per student session."""
+    if "thread_id" not in session:
+        # make a real API thread so history persists per student
+        r = requests.post("https://api.openai.com/v1/threads",
+                          headers=OPENAI_ASSIST_HEADERS, timeout=30)
+        r.raise_for_status()
+        session["thread_id"] = r.json()["id"]
+    return session["thread_id"]
+
+# -------- tiny helpers --------
+def _safe_json(req):
     data = req.get_json(silent=True)
-    if isinstance(data, dict):
-        return data
+    if isinstance(data, dict): return data
     if isinstance(data, str):
         try:
-            j = json.loads(data)
-            return j if isinstance(j, dict) else {}
-        except Exception:
-            return {}
+            j = json.loads(data); return j if isinstance(j, dict) else {}
+        except Exception: return {}
     if data is None:
         try:
             raw = req.get_data(cache=False, as_text=True)
-            j = json.loads(raw)
-            return j if isinstance(j, dict) else {}
-        except Exception:
-            return {}
+            j = json.loads(raw); return j if isinstance(j, dict) else {}
+        except Exception: return {}
     return {}
 
-def _data_url_info(data_url: str):
-    """
-    Parse a data URL like 'data:image/png;base64,AAAA...' -> (mime, is_b64, bytes, byte_len)
-    Raises ValueError if not a data URL.
-    """
-    if not isinstance(data_url, str) or not data_url.startswith("data:"):
-        raise ValueError("Not a data URL")
-    header, payload = data_url.split(",", 1)
-    # header example: data:image/png;base64
-    mime = "text/plain"
-    is_b64 = False
-    try:
-        head = header[5:]  # strip 'data:'
-        if ";base64" in head:
-            is_b64 = True
-            mime = head.replace(";base64", "") or mime
-        else:
-            mime = head or mime
-    except Exception:
-        pass
-
-    if is_b64:
-        try:
-            blob = base64.b64decode(payload, validate=True)
-        except Exception:
-            # fall back: len of raw payload only
-            blob = b""
-    else:
-        blob = payload.encode("utf-8", errors="ignore")
-    return mime, is_b64, blob, len(blob)
-
-# ---------- routes ----------
+# -------- health --------
 @app.route("/health")
 def health():
     return jsonify(ok=True), 200
 
-@app.route("/api/ping", methods=["POST"])
-def ping():
+# -------- core: send images directly to your Assistant --------
+@app.route("/api/assist", methods=["POST"])
+def assist_api():
     """
-    JSON body:
+    Body:
       {
         "f_image": "data:image/...;base64,...",
         "g_image": "data:image/...;base64,..."
       }
-    Returns: { "latex": "$$...$$" }
+    Returns: { "assistant_text": "<model output>" }
     """
-    data = _safe_json_from_request(request)
+    data = _safe_json(request)
     f_img = data.get("f_image")
     g_img = data.get("g_image")
-
     if not f_img or not g_img:
-        return jsonify({"error": "Both f_image and g_image are required (data URLs)."}), 400
+        return jsonify({"error":"Both f_image and g_image are required (data URLs)."}), 400
 
     try:
-        f_mime, f_b64, f_bytes, f_len = _data_url_info(f_img)
-        g_mime, g_b64, g_bytes, g_len = _data_url_info(g_img)
+        thread_id = ensure_thread()
 
-        # Build a friendly LaTeX echo proving the server received both images.
-        # (MathJax on the page will render this.)
-        latex = (
-            "$$\\text{Upload OK: received two images.}\\\\"
-            f"\\text{{f(x) mime}}={{{{ {f_mime} }}}},\\; "
-            f"\\text{{base64}}={str(f_b64).lower()},\\; "
-            f"\\text{{bytes}}={f_len}\\\\"
-            f"\\text{{g(x) mime}}={{{{ {g_mime} }}}},\\; "
-            f"\\text{{base64}}={str(g_b64).lower()},\\; "
-            f"\\text{{bytes}}={g_len}$$"
+        # Build message content for Assistants v2:
+        # - one short text to label the images
+        # - two image parts (data URLs allowed)
+        content = [
+            {"type": "input_text",
+             "text": "Please analyze the student's derivative attempt. "
+                     "The first image is the original function f(x). "
+                     "The second image is the student's derivative g(x). "
+                     "Respond per your tutoring instructions (LaTeX-first)."},
+            {"type": "input_image", "image_url": f_img},
+            {"type": "input_image", "image_url": g_img},
+        ]
+
+        # 1) Add message with images
+        r1 = requests.post(
+            f"https://api.openai.com/v1/threads/{thread_id}/messages",
+            headers=OPENAI_ASSIST_HEADERS,
+            json={"role": "user", "content": content},
+            timeout=60
         )
-        return jsonify({"latex": latex}), 200
+        if r1.status_code >= 400:
+            return jsonify({"error":"Assistant add-message error","details":r1.text}), 502
+
+        # 2) Run the Assistant (text output)
+        r2 = requests.post(
+            f"https://api.openai.com/v1/threads/{thread_id}/runs",
+            headers=OPENAI_ASSIST_HEADERS,
+            json={"assistant_id": ASSISTANT_ID, "response_format": {"type":"text"}},
+            timeout=60
+        )
+        if r2.status_code >= 400:
+            return jsonify({"error":"Assistant run error","details":r2.text}), 502
+        run_id = r2.json()["id"]
+
+        # 3) Poll until complete
+        while True:
+            rr = requests.get(
+                f"https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}",
+                headers=OPENAI_ASSIST_HEADERS, timeout=60
+            )
+            st = rr.json().get("status")
+            if st in ("completed","failed","cancelled","expired"):
+                break
+            time.sleep(0.6)
+        if st != "completed":
+            return jsonify({"error": f"run status: {st}", "details": rr.text}), 502
+
+        # 4) Fetch latest assistant message
+        msgs = requests.get(
+            f"https://api.openai.com/v1/threads/{thread_id}/messages?limit=1&order=desc",
+            headers=OPENAI_ASSIST_HEADERS, timeout=60
+        ).json()["data"]
+
+        # Safely extract text
+        out_text = ""
+        if msgs and "content" in msgs[0]:
+            for part in msgs[0]["content"]:
+                if part.get("type") == "text":
+                    out_text += part["text"]["value"]
+
+        return jsonify({"assistant_text": out_text or "[no text]"}), 200
 
     except Exception as e:
-        return jsonify({"error": "server_exception", "details": str(e)}), 500
+        return jsonify({"error":"server_exception","details":str(e)}), 500
 
+# -------- minimal UI: two image inputs -> Assistant reply --------
 @app.route("/")
 def ui():
-    # Minimal UI: two image uploads -> POST /api/ping -> render LaTeX
     return """
 <!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Derivative Tutor — Upload Test</title>
+<title>Derivative Tutor — Assistant Image Test</title>
 <script id="MathJax-script" async
   src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 <style>
@@ -128,31 +159,31 @@ def ui():
   input[type="file"] { width:100%; padding:10px; border:1px solid #ccc; border-radius:8px; }
   button { padding:10px 14px; border:0; border-radius:8px; cursor:pointer; background:#0ea5e9; color:#fff; }
   #out { margin-top:16px; }
-  .latex { padding:10px; background:#fff; border:1px solid #eee; border-radius:8px; }
+  .latex { padding:10px; background:#fff; border:1px solid #eee; border-radius:8px; white-space:pre-wrap; }
   img.preview { max-width:100%; border:1px solid #eee; border-radius:8px; }
   .bad { color:#991b1b; font-weight:700; }
   .gray { color:#666; }
 </style>
 
-<h2>Derivative Tutor — Upload Test</h2>
-<p class="gray">Goal: make sure the server receives two images and returns LaTeX.</p>
+<h2>Assistant Image Test</h2>
+<p class="gray">Uploads go straight to your Assistant; we render its text with MathJax.</p>
 
 <div class="card">
   <div class="row">
     <div class="col">
-      <label>Upload function f(x) image</label>
+      <label>Function image (f)</label>
       <input id="fimg" type="file" accept="image/*" capture="environment">
       <div><img id="fprev" class="preview" /></div>
     </div>
     <div class="col">
-      <label>Upload your derivative g(x) image</label>
+      <label>Student derivative image (g)</label>
       <input id="gimg" type="file" accept="image/*" capture="environment">
       <div><img id="gprev" class="preview" /></div>
     </div>
   </div>
   <div class="row" style="margin-top:12px">
     <div class="col" style="align-self:end">
-      <button id="go">Send test</button>
+      <button id="go">Ask Assistant</button>
     </div>
   </div>
 </div>
@@ -164,56 +195,45 @@ const fimg = document.getElementById('fimg');
 const gimg = document.getElementById('gimg');
 const fprev = document.getElementById('fprev');
 const gprev = document.getElementById('gprev');
-const btn = document.getElementById('go');
-const out = document.getElementById('out');
+const btn  = document.getElementById('go');
+const out  = document.getElementById('out');
 
-function toDataURL(file) {
-  return new Promise((resolve, reject) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(fr.result);
-    fr.onerror = reject;
-    fr.readAsDataURL(file); // always data:image/...;base64,....
+function toDataURL(file){
+  return new Promise((resolve,reject)=>{
+    const fr=new FileReader();
+    fr.onload=()=>resolve(fr.result);
+    fr.onerror=reject;
+    fr.readAsDataURL(file); // -> data:image/...;base64,....
   });
 }
+fimg.addEventListener('change', async ()=>{ if(fimg.files[0]) fprev.src = await toDataURL(fimg.files[0]); });
+gimg.addEventListener('change', async ()=>{ if(gimg.files[0]) gprev.src = await toDataURL(gimg.files[0]); });
 
-fimg.addEventListener('change', async () => {
-  if (fimg.files[0]) fprev.src = await toDataURL(fimg.files[0]);
-});
-gimg.addEventListener('change', async () => {
-  if (gimg.files[0]) gprev.src = await toDataURL(gimg.files[0]);
-});
-
-btn.addEventListener('click', async () => {
-  out.innerHTML = '<p class="gray">Sending…</p>';
-  if (!fimg.files[0] || !gimg.files[0]) {
-    out.innerHTML = '<p class="bad">Please upload both images.</p>'; return;
-  }
-  const [fdata, gdata] = await Promise.all([toDataURL(fimg.files[0]), toDataURL(gimg.files[0])]);
-
-  try {
-    const r = await fetch('/api/ping', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
+btn.addEventListener('click', async ()=>{
+  out.innerHTML = '<p class="gray">Sending to Assistant…</p>';
+  if(!fimg.files[0] || !gimg.files[0]){ out.innerHTML='<p class="bad">Please upload both images.</p>'; return; }
+  const [fdata,gdata] = await Promise.all([toDataURL(fimg.files[0]), toDataURL(gimg.files[0])]);
+  try{
+    const r = await fetch('/api/assist', {
+      method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ f_image: fdata, g_image: gdata })
     });
-    const ct = (r.headers.get('content-type')||'').toLowerCase();
+    const ct=(r.headers.get('content-type')||'').toLowerCase();
     const data = ct.includes('application/json') ? await r.json() : {error: await r.text()};
-
-    if (data.error) {
-      out.innerHTML = '<p class="bad">Error: ' + (data.error || 'unknown') + '</p><pre class="gray">' + (data.details||'') + '</pre>';
-      return;
+    if(data.error){
+      out.innerHTML = '<p class="bad">Error: '+(data.error||'unknown')+'</p><pre class="gray">'+(data.details||'')+'</pre>'; return;
     }
-    out.innerHTML = '<div class="card latex">' + (data.latex||'') + '</div>';
-    if (window.MathJax) MathJax.typesetPromise();
-  } catch (err) {
-    out.innerHTML = '<p class="bad">Network error: ' + err + '</p>';
+    out.innerHTML = '<div class="card latex">'+(data.assistant_text||'')+'</div>';
+    if(window.MathJax) MathJax.typesetPromise();
+  }catch(err){
+    out.innerHTML = '<p class="bad">Network error: '+err+'</p>';
   }
 });
 
-// gentle warm-up ping (helps on Free tier)
+// small warm-up ping
 (async()=>{ try{ await fetch('/health',{cache:'no-store'}) }catch(e){} })();
 </script>
 """
-# ---------- entry ----------
+# -------- entry --------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
