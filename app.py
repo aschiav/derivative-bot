@@ -1,4 +1,4 @@
-import os, time, json, math, random, requests
+import os, time, json, math, random, re, requests
 from flask import Flask, request, jsonify, session
 
 # ── SymPy for parsing & checking ───────────────────────────────────────────────
@@ -10,13 +10,12 @@ from sympy import asin, acos, atan
 from sympy import sinh, cosh, tanh, asinh, acosh, atanh
 from sympy import log, sqrt, Abs, latex
 
-
 # ── Flask setup ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "change-me")
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",
-    SESSION_COOKIE_SECURE=True  # required for Canvas iframe (HTTPS)
+    SESSION_COOKIE_SECURE=True  # needed in Canvas iframe over HTTPS
 )
 
 # Allow Canvas to iframe your app
@@ -28,39 +27,25 @@ def add_headers(resp):
     resp.headers["X-Frame-Options"] = "ALLOWALL"
     return resp
 
-# ── OpenAI config (Responses API) ─────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
+ASSISTANT_ID = os.environ.get("ASSISTANT_ID")  # ← your gpt-4.1 Assistant (asst_...)
+OCR_MODEL = os.environ.get("OCR_MODEL", "gpt-4o-mini")  # fast/vision model for OCR
 
 OPENAI_HEADERS = {
     "Authorization": f"Bearer {OPENAI_API_KEY}",
     "Content-Type": "application/json"
 }
-
-VISION_MODEL = os.environ.get("VISION_MODEL", "gpt-4o-mini")  # vision-capable
-
-# ── Structured Outputs schema (Responses API text.format) ─────────────────────
-STRUCTURED_MATH_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "expr_sympy": {"type": "string", "description": "SymPy syntax, e.g., sin(x)**2/(x+1)"},
-        "expr_latex": {"type": "string", "description": "LaTeX, e.g., \\frac{\\sin^2 x}{x+1}"},
-        "variable":   {"type": "string", "description": "primary variable, e.g., x"}
-    },
-    # REQUIRED must include every key in properties:
-    "required": ["expr_sympy", "expr_latex", "variable"],
-    "additionalProperties": False
+OPENAI_ASSISTANT_HEADERS = {
+    **OPENAI_HEADERS,
+    "OpenAI-Beta": "assistants=v2"
 }
 
-# ── Helpers: per-student session thread id (not strictly needed) ──────────────
-def ensure_thread():
-    if "thread_id" not in session:
-        session["thread_id"] = f"local-{int(time.time()*1000)}-{random.randint(1000,9999)}"
-    return session["thread_id"]
-
-# ── Math parsing & comparison helpers ─────────────────────────────────────────
+# ── Utilities ─────────────────────────────────────────────────────────────────
 def _safe_json_from_request(req):
+    """Always return a dict for incoming POST JSON (handles odd bodies)."""
     data = req.get_json(silent=True)
     if isinstance(data, dict):
         return data
@@ -78,7 +63,17 @@ def _safe_json_from_request(req):
         except Exception:
             return {}
     return {}
-    
+
+def ensure_thread():
+    """One thread per student session—used only for your Assistant reply."""
+    if "thread_id" not in session:
+        r = requests.post("https://api.openai.com/v1/threads",
+                          headers=OPENAI_ASSISTANT_HEADERS, timeout=30)
+        r.raise_for_status()
+        session["thread_id"] = r.json()["id"]
+    return session["thread_id"]
+
+# ── SymPy helpers ─────────────────────────────────────────────────────────────
 def allowed_locals(varname="x"):
     x = symbols(varname)
     return {
@@ -96,21 +91,18 @@ def parse_sympy(expr_str, varname="x"):
     return sympify(expr_str, locals=allowed_locals(varname))
 
 def numeric_equiv(f_expr, g_expr, varname="x"):
-    """Heuristic numeric check on a spread of points."""
+    """Heuristic numeric check on several points."""
     x = symbols(varname)
     f = lambdify(x, simplify(f_expr), "mpmath")
     g = lambdify(x, simplify(g_expr), "mpmath")
-    candidates = [-3, -2, -1, -0.5, -1/3, 0.5, 1, 2, 3]
+    pts = [-3, -2, -1, -0.5, -1/3, 0.5, 1, 2, 3]
     tested = matched = 0
-    for t in candidates:
+    for t in pts:
         try:
             fv, gv = f(t), g(t)
-            if fv is None or gv is None:
-                continue
-            if isinstance(fv, float) and (math.isnan(fv) or math.isinf(fv)):
-                continue
-            if isinstance(gv, float) and (math.isnan(gv) or math.isinf(gv)):
-                continue
+            if fv is None or gv is None: continue
+            if isinstance(fv, float) and (math.isnan(fv) or math.isinf(fv)): continue
+            if isinstance(gv, float) and (math.isnan(gv) or math.isinf(gv)): continue
             if abs(fv - gv) <= 1e-6 * (1 + abs(fv) + abs(gv)):
                 matched += 1
             tested += 1
@@ -120,104 +112,68 @@ def numeric_equiv(f_expr, g_expr, varname="x"):
         return True, {"tested": tested, "matched": matched}
     return False, {"tested": tested, "matched": matched}
 
-# ── Robust coercion (avoid .get on strings) ───────────────────────────────────
-def _coerce_ocr(obj):
-    if isinstance(obj, dict):
-        return {
-            "expr_sympy": obj.get("expr_sympy", ""),
-            "expr_latex": obj.get("expr_latex", obj.get("expr_sympy", "")),
-            "variable":   (obj.get("variable") or "x")
-        }
-    if isinstance(obj, str):
-        try:
-            j = json.loads(obj)
-            return _coerce_ocr(j)
-        except Exception:
-            return {"expr_sympy": obj, "expr_latex": obj, "variable": "x"}
-    return {"expr_sympy": "", "expr_latex": "", "variable": "x"}
+# ── OCR (Responses API, plain text; no structured outputs) ────────────────────
+OCR_PROMPT = (
+    "Read the math expression in the image. Return exactly three lines, no extra text:\n"
+    "SYMPY: <expression in SymPy syntax using ** for powers and log() for natural log>\n"
+    "LATEX: <the same expression in LaTeX>\n"
+    "VAR: <single main variable symbol, like x>\n"
+    "Do not compute anything; just transcribe what is written."
+)
 
-# ── Vision OCR via Responses API (with text.format structured outputs) ────────
-def extract_expr_from_image(data_url, hint_text=""):
+def ocr_math(data_url, hint=""):
     """
-    Return dict: { expr_sympy, expr_latex, variable }
-    `data_url` must be a data: URL (data:image/...;base64,...)
+    Send a data URL image to a vision model and parse the 3-line response.
+    Returns dict {expr_sympy, expr_latex, variable}. Never returns a bare string.
     """
     if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
-        raise RuntimeError("Expected a data URL (data:image/...;base64,...)")
+        raise RuntimeError("Expected data URL (data:image/...;base64,...)")
 
-    prompt = (
-        "Extract the mathematical expression from this image. "
-        "Return JSON with keys: expr_sympy (SymPy syntax; use ** for powers; use log for natural log), "
-        "expr_latex (best-effort LaTeX), and variable (default 'x'). "
-        "If the image shows a derivative, transcribe exactly what's shown; do not compute a new derivative."
-    )
-    if hint_text:
-        prompt += f" Hint/context: {hint_text}"
-
-    payload = {
-        "model": VISION_MODEL,  # e.g., "gpt-4o-mini" or "gpt-4o"
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": data_url}  # string URL
-            ]
-        }],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "math_from_image",
-                "strict": True,
-                "schema": STRUCTURED_MATH_SCHEMA
-            }
-        }
-    }
+    content = [
+        {"type": "input_text", "text": OCR_PROMPT + (f"\nContext: {hint}" if hint else "")},
+        {"type": "input_image", "image_url": data_url}  # string URL per Responses API
+    ]
+    payload = {"model": OCR_MODEL, "input": [{"role": "user", "content": content}]}
 
     r = requests.post("https://api.openai.com/v1/responses",
                       headers=OPENAI_HEADERS, json=payload, timeout=90)
-
-    # If the API returns non-JSON or an error, raise a clear error
     if r.status_code >= 400:
-        raise RuntimeError(f"Vision OCR error {r.status_code}: {r.text}")
+        raise RuntimeError(f"OCR {r.status_code}: {r.text}")
 
-    try:
-        j = r.json()
-    except Exception:
-        # Totally unexpected—treat as empty
-        return {"expr_sympy": "", "expr_latex": "", "variable": "x"}
+    j = r.json()
+    # Prefer output_text; fall back to digging if needed
+    text = j.get("output_text") or (j.get("output") or [{}])[0].get("content", [{}])[0].get("text", {}).get("value", "")
+    if not isinstance(text, str):
+        text = str(text)
 
-    # Ensure j is a dict; if it's somehow a string, coerce below
-    text = None
-    if isinstance(j, dict):
-        text = j.get("output_text")
-        if not text:
-            text = (j.get("output") or [{}])[0].get("content", [{}])[0].get("text", {}).get("value")
+    # Parse lines
+    sympy_s = latex_s = var_s = ""
+    for line in text.strip().splitlines():
+        if line.upper().startswith("SYMPY:"):
+            sympy_s = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("LATEX:"):
+            latex_s = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("VAR:"):
+            var_s = line.split(":", 1)[1].strip()
+    if not var_s: var_s = "x"
 
-    if not text and isinstance(j, str):
-        text = j
+    # Minimal cleaning
+    sympy_s = sympy_s.strip().strip("`")
+    latex_s  = latex_s.strip().strip("`")
+    var_s    = re.sub(r"[^A-Za-z]", "", var_s) or "x"
 
-    # Final coercion to dict
-    if not text:
-        return {"expr_sympy": "", "expr_latex": "", "variable": "x"}
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return {
-                "expr_sympy": obj.get("expr_sympy", ""),
-                "expr_latex": obj.get("expr_latex", obj.get("expr_sympy", "")),
-                "variable":   (obj.get("variable") or "x")
-            }
-        # If JSON was something else (array/string), fall through to wrapper
-    except Exception:
-        pass
-    return {"expr_sympy": text, "expr_latex": text, "variable": "x"}
+    return {
+        "expr_sympy": sympy_s,
+        "expr_latex": latex_s or sympy_s,
+        "variable": var_s
+    }
 
-
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
     return jsonify(ok=True), 200
 
+# ── Core API: upload → OCR → check → ask your Assistant for the tutoring reply ─
 @app.route("/api/check", methods=["POST"])
 def check_derivative():
     """
@@ -225,10 +181,10 @@ def check_derivative():
       {
         "f_image": "data:image/...;base64,...",
         "g_image": "data:image/...;base64,...",
-        "variable": "x"
+        "variable": "x"   # optional
       }
     """
-    data = _safe_json_from_request(request)   # <- from earlier snippet
+    data = _safe_json_from_request(request)
     f_img = data.get("f_image")
     g_img = data.get("g_image")
     varname = (data.get("variable") or "x").strip() or "x"
@@ -238,73 +194,116 @@ def check_derivative():
 
     try:
         # 1) OCR both images
-        raw_f = extract_expr_from_image(f_img, "This is the original function f(x).")
-        raw_g = extract_expr_from_image(g_img, "This is the student's claimed derivative g(x).")
+        f_ocr = ocr_math(f_img, "This is the original function f(x).")
+        g_ocr = ocr_math(g_img, "This is the student's derivative g(x).")
 
-        # 2) Coerce to dicts so .get(...) is always safe
-        f_obj = _coerce_ocr(raw_f)
-        g_obj = _coerce_ocr(raw_g)
+        # 2) Parse with SymPy (robust to OCR noise if possible)
+        var = (f_ocr.get("variable") or varname).strip() or varname
+        f_expr = parse_sympy(f_ocr.get("expr_sympy", ""), var)
+        g_expr = parse_sympy(g_ocr.get("expr_sympy", ""), var)
 
-        # 3) Pull strings and variable
-        f_sym = f_obj.get("expr_sympy", "")
-        g_sym = g_obj.get("expr_sympy", "")
-        var   = (f_obj.get("variable") or varname).strip() or varname
-
-        # 4) Parse and compute derivative
-        f_expr = parse_sympy(f_sym, var)
-        g_expr = parse_sympy(g_sym, var)
+        # 3) Compute correct derivative
         x = symbols(var)
         fprime = simplify(diff(f_expr, x))
 
-        # 5) Checks
+        # 4) Compare
         symbolic_ok = simplify(fprime - g_expr) == 0
         numeric_ok, stats = numeric_equiv(fprime, g_expr, var)
         verdict = "correct" if (symbolic_ok or numeric_ok) else "incorrect"
 
-        # 6) Build response
-        result = {
+        # 5) Ask YOUR Assistant (gpt-4.1, response_format=text) to explain kindly in LaTeX-first
+        if not ASSISTANT_ID:
+            explain_text = (
+                "Assistant ID is not set on the server, so I cannot generate the tutoring reply. "
+                "However, here is the system check result:\n"
+                f"- f(x) parsed: {latex(f_expr)}\n"
+                f"- Computed d/d{var} f(x): {latex(fprime)}\n"
+                f"- Student g(x): {latex(g_expr)}\n"
+                f"- Match: {verdict}"
+            )
+        else:
+            thread_id = ensure_thread()
+            # Build a single user message that your Assistant will respond to in its own tone/instructions.
+            user_msg = (
+                "Please analyze this derivative attempt as a supportive tutor per your instructions.\n\n"
+                f"Function (from image): $${latex(f_expr)}$$\n"
+                f"Student's derivative (from image): $${latex(g_expr)}$$\n"
+                f"Computed derivative (for reference): $${latex(fprime)}$$\n"
+                f"Variable: ${var}$\n\n"
+                "Important: Start with your LaTeX reasoning and derivation first. "
+                "Only after that reasoning, give your gentle concluding judgment and guidance."
+            )
+
+            # Add message
+            r1 = requests.post(
+                f"https://api.openai.com/v1/threads/{thread_id}/messages",
+                headers=OPENAI_ASSISTANT_HEADERS,
+                json={"role": "user", "content": user_msg},
+                timeout=30
+            )
+            if r1.status_code >= 400:
+                return jsonify({"error": "Assistant add-message error", "details": r1.text}), 502
+
+            # Run with text output (since your Assistant is set to text)
+            r2 = requests.post(
+                f"https://api.openai.com/v1/threads/{thread_id}/runs",
+                headers=OPENAI_ASSISTANT_HEADERS,
+                json={"assistant_id": ASSISTANT_ID, "response_format": {"type": "text"}},
+                timeout=30
+            )
+            if r2.status_code >= 400:
+                return jsonify({"error": "Assistant run error", "details": r2.text}), 502
+            run_id = r2.json()["id"]
+
+            # Poll
+            while True:
+                rr = requests.get(
+                    f"https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}",
+                    headers=OPENAI_ASSISTANT_HEADERS, timeout=30
+                )
+                st = rr.json().get("status")
+                if st in ("completed", "failed", "cancelled", "expired"):
+                    break
+                time.sleep(0.6)
+            if st != "completed":
+                return jsonify({"error": f"run status: {st}", "details": rr.text}), 502
+
+            # Read latest assistant message
+            msgs = requests.get(
+                f"https://api.openai.com/v1/threads/{thread_id}/messages?limit=1&order=desc",
+                headers=OPENAI_ASSISTANT_HEADERS, timeout=30
+            ).json()["data"]
+
+            explain_text = ""
+            for part in msgs[0].get("content", []):
+                if part.get("type") == "text":
+                    explain_text += part["text"]["value"]
+
+        # 6) Build API response for the UI
+        out = {
+            "latex": {
+                "f_expr": f_ocr.get("expr_latex") or latex(f_expr),
+                "g_expr": g_ocr.get("expr_latex") or latex(g_expr),
+                "computed_fprime": latex(fprime)
+            },
             "parsed": {
                 "f_expr_sympy": str(f_expr),
                 "g_expr_sympy": str(g_expr),
                 "variable": var
-            },
-            "latex": {
-                "f_expr": f_obj.get("expr_latex") or latex(f_expr),
-                "g_expr": g_obj.get("expr_latex") or latex(g_expr),
-                "computed_fprime": latex(fprime)
             },
             "checks": {
                 "symbolic_equal": bool(symbolic_ok),
                 "numeric_equal": bool(numeric_ok),
                 "numeric_stats": stats
             },
-            "verdict": verdict
+            "verdict": verdict,
+            "assistant_text": explain_text
         }
-
-        # Optional: short hint if incorrect
-        if verdict == "incorrect":
-            hint_prompt = (
-                "Compare the derivative. Given f(x) and a student's g(x), "
-                "explain briefly (<= 3 lines) why g(x) differs from d/dx f(x), "
-                "naming any rule that seems misapplied. Use plain text."
-            )
-            hint_in = f"f(x) = {str(f_expr)}\nCorrect d/dx f(x) = {str(fprime)}\nStudent g(x) = {str(g_expr)}"
-            hr = requests.post("https://api.openai.com/v1/responses",
-                               headers=OPENAI_HEADERS,
-                               json={"model": "gpt-4o-mini", "input": f"{hint_prompt}\n\n{hint_in}"},
-                               timeout=60)
-            if hr.status_code < 400:
-                hj = hr.json()
-                hint_text = hj.get("output_text") or \
-                    (hj.get("output") or [{}])[0].get("content", [{}])[0].get("text", {}).get("value")
-                if hint_text:
-                    result["hint"] = hint_text.strip()
-
-        return jsonify(result), 200
+        return jsonify(out), 200
 
     except Exception as e:
         return jsonify({"error": "server_exception", "details": str(e)}), 500
-
+        
 @app.route("/")
 def ui():
     # Minimal UI: two image uploads → /api/check
