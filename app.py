@@ -108,11 +108,24 @@ EXTRACT_SCHEMA = {
     }
 }
 
+# Put the schema in one constant so there's no mismatch
+STRUCTURED_MATH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "expr_sympy": {"type": "string", "description": "SymPy syntax, e.g., sin(x)**2/(x+1)"},
+        "expr_latex": {"type": "string", "description": "LaTeX, e.g., \\frac{\\sin^2 x}{x+1}"},
+        "variable":   {"type": "string", "description": "primary variable, e.g., x"}
+    },
+    # ✅ REQUIRED must include EVERY key in properties
+    "required": ["expr_sympy", "expr_latex", "variable"],
+    "additionalProperties": False
+}
+
 def extract_expr_from_image(data_url, hint_text=""):
     """
-    Ask a vision model to read math from an image and return JSON:
+    Ask a vision model to read math from an image and return:
       { expr_sympy, expr_latex, variable }
-    Expects data_url like: data:image/png;base64,AAAA...
+    Expects a data URL: data:image/...;base64,....
     """
     if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
         raise RuntimeError("Expected a data URL for image (data:image/...;base64,...)")
@@ -121,7 +134,7 @@ def extract_expr_from_image(data_url, hint_text=""):
         "Extract the mathematical expression from this image. "
         "Return JSON with keys: expr_sympy (SymPy syntax; use ** for powers; use log for ln), "
         "expr_latex (best-effort LaTeX), and variable (default 'x'). "
-        "If the image already shows a derivative, just transcribe what's shown; do not compute a new derivative."
+        "If the image shows a derivative, just transcribe it as written—do not compute a new derivative."
     )
     if hint_text:
         prompt += f" Hint/context: {hint_text}"
@@ -133,31 +146,25 @@ def extract_expr_from_image(data_url, hint_text=""):
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt},
-                    # IMPORTANT: image_url must be a STRING, not {"url": "..."}
-                    {"type": "input_image", "image_url": data_url}
+                    {"type": "input_image", "image_url": data_url}  # string, not {"url": ...}
                 ]
             }
         ],
-        # Responses API structured outputs now live under text.format
+        # ✅ Responses API: structured outputs go under text.format
         "text": {
             "format": {
                 "type": "json_schema",
                 "name": "math_from_image",
                 "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "expr_sympy": {"type": "string", "description": "SymPy syntax, e.g., sin(x)**2/(x+1)"},
-                        "expr_latex": {"type": "string", "description": "LaTeX, e.g., \\\\frac{\\\\sin^2 x}{x+1}"},
-                        "variable":   {"type": "string", "description": "primary variable, e.g., x"}
-                    },
-                    # 👇 Make every property required
-                    "required": ["expr_sympy", "expr_latex", "variable"],
-                    "additionalProperties": False
-                }
+                "schema": STRUCTURED_MATH_SCHEMA
             }
         }
     }
+
+    # Optional: set DEBUG_SCHEMA=1 in Render env to verify what we're sending
+    if os.environ.get("DEBUG_SCHEMA") == "1":
+        print("DEBUG text.format.schema =",
+              json.dumps(payload["text"]["format"]["schema"], ensure_ascii=False))
 
     r = requests.post("https://api.openai.com/v1/responses",
                       headers=OPENAI_HEADERS, json=payload, timeout=90)
@@ -165,16 +172,13 @@ def extract_expr_from_image(data_url, hint_text=""):
         raise RuntimeError(f"Vision OCR error {r.status_code}: {r.text}")
 
     j = r.json()
-    # Prefer output_text; fall back to digging into content if needed
     text = j.get("output_text") or \
            (j.get("output") or [{}])[0].get("content", [{}])[0].get("text", {}).get("value")
 
     try:
         return json.loads(text) if text else {"expr_sympy": "", "expr_latex": "", "variable": "x"}
     except Exception:
-        # If the model returned plain text, wrap it
         return {"expr_sympy": text or "", "expr_latex": text or "", "variable": "x"}
-
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
