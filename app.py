@@ -109,10 +109,6 @@ EXTRACT_SCHEMA = {
 }
 
 def extract_expr_from_image(data_url, hint_text=""):
-    """
-    Ask a vision model to read the math from an image and return SymPy + LaTeX.
-    `data_url` must be a data: URL (data:image/...;base64,....)
-    """
     prompt = (
         "Extract the mathematical expression from this image. "
         "Return JSON with keys: expr_sympy (SymPy syntax; use ** for powers; use log for ln), "
@@ -123,22 +119,25 @@ def extract_expr_from_image(data_url, hint_text=""):
         prompt += f" Hint/context: {hint_text}"
 
     payload = {
-    "model": VISION_MODEL,
-    "input": [{
-        "role": "user",
-        "content": [
-            {"type": "input_text", "text": prompt},
-            {"type": "input_image", "image_url": {"url": data_url}}
-        ]
-    }],
-    "text": {                                 # ✅ Responses API uses text.format
-        "format": {
-            "type": "json_schema",
-            "json_schema": EXTRACT_SCHEMA
+        "model": VISION_MODEL,  # e.g., gpt-4o-mini
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    # 👇 IMPORTANT: pass the data URL string directly
+                    {"type": "input_image", "image_url": data_url}
+                ]
+            }
+        ],
+        # Responses API structured output goes under text.format (not response_format)
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "json_schema": EXTRACT_SCHEMA
+            }
         }
     }
-}
-
 
     r = requests.post("https://api.openai.com/v1/responses",
                       headers=OPENAI_HEADERS, json=payload, timeout=90)
@@ -146,21 +145,12 @@ def extract_expr_from_image(data_url, hint_text=""):
         raise RuntimeError(f"Vision OCR error {r.status_code}: {r.text}")
 
     j = r.json()
-    # Responses API: prefer output_text; else try to locate JSON substring
-    text = j.get("output_text")
-    if not text:
-        # Attempt to dig into structured fields if output_text missing
-        try:
-            text = j["output"][0]["content"][0]["text"]["value"]
-        except Exception:
-            text = json.dumps(j)
-
+    text = j.get("output_text") or j.get("output", [{}])[0].get("content", [{}])[0].get("text", {}).get("value")
     try:
-        obj = json.loads(text)
+        return json.loads(text) if text else {"expr_sympy": "", "expr_latex": "", "variable": "x"}
     except Exception:
-        # If model returned plain text, wrap it
-        obj = {"expr_sympy": text, "expr_latex": text, "variable": "x"}
-    return obj
+        return {"expr_sympy": text or "", "expr_latex": text or "", "variable": "x"}
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/health")
